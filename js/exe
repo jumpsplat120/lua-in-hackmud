@@ -1,0 +1,1187 @@
+function(context, args) {
+    let exports, memory, meta_length, code;
+
+    args = args || {};
+
+    //if (context.caller !== "lua54") return ({ ok: false, msg:"sorry, we're not open right now"})
+
+    if (!args.code) return ({ ok:false, msg: "Missing `Ncode`." });
+
+    if (typeof args.code !== "string") throw new TypeError("`Ncode` is not of type `Cstring`.");
+
+    if (args.reset) {
+        //Disabled for safety.
+        //#db.r({ wasm: true });
+        
+        return "Cleared bytecode.";
+    }
+
+    if (args.input) {
+        const out = [];
+    
+        for (const num of args.input.split(",")) out.push(Number(num));
+        //Disabled for safety.
+        //#db.us({ wasm: true }, { $push: { data: { $each: out } } });
+        
+        return "Wasm line added.";
+    }
+
+    //Howdy! :3
+    if (args.quine) return #fs.scripts.quine();
+    
+    const lib = #fs.antimony.lib();
+    const CEF = lib.CustomErrorFactory;
+
+    //Type of error that gets thrown when we screw up when decoding something.
+    const LuaParserError = CEF("`D.:: LUA54 PARSER ERROR ::.`");
+
+    //Throws on severe cases; generally some sort of screw up in the JS itself.
+    const LuaSevereError = CEF("`D.:: LUA54 SEVERE ERROR ::.`");
+    
+    //When we tried to invalidly access the DB. So far, it's only throw is when we attempt to wipe the DB.
+    const DatabaseAccessError = CEF("`D.:: LUA54 DATABASE ERROR ::.`");
+
+    //Type of error that gets thrown when there's an interpreter error. This is on us, as user code will be caught
+    //by the new error function.
+    const LuaSyntaxError = CEF("LuaSyntaxError");
+
+    //For when a user tries to fetch a module they don't have access to, but within preload instead of within their
+    //lua code. This is a special error, since a lua error insinuates we're running lua. LuaPreloadError fires before
+    //we ever start.
+    const LuaPreloadError = CEF("LuaPreloadError");
+
+    //Fetch the bytecode. It's the only db entry with the wasm flag, and should *always* be the only one with said
+    //flag. While the user can affect the db, they can't set arbitrary flags, so we don't have to worry about seeing
+    //this somewhere it shouldn't be.
+    const wasm = (#db.f({ wasm: true }).first() || {}).data;
+    
+    //If, for some reason the bytecode is missing, follow the instructions on the GH to rebuild.
+    if (!wasm) throw new LuaSevereError("Lua bytecode is missing!");
+    
+    //Set's the author of the script based on the name of the script that is calling lua54.exe. If there isn't one,
+    //then we're running on the CLI, so we set it to the caller. If user_a calls user_b.script, then user_b is the
+    //one who's the author of that particular lua script, even if all they did was write a wrapper over someone
+    //elses module.
+    context.author = (context.calling_script || context.caller).split(".")[0];
+
+    //By adding FMCL and the run_id to the context object, when a user requests the context object, they also get
+    //these values, rather than needing to call out for them seperately. This is explained more in the context/args
+    //action in Decoder.process, but basically we want the user to always have a way to get accurate values without
+    //worrying that someone else's library has modified a global value to no longer be accurate.
+    context.FMCL   = #FMCL;
+    context.run_id = _RUN_ID;
+
+    //Save user's modules to avoid having to refetch them from the db.
+    const user_modules = {};
+
+    //We want to store our preloaded modules seperately, even though they'll also be in user_modules. This is so
+    //we can loop through them without adding *every* user's modules that have been fetched.
+    const preload_modules = {};
+
+    //Shorthand for the Symbol.for constructor.
+    const Sym = v => Symbol.for(v);
+
+    //Do nothing function for the various imports that need *something*, but don't otherwise need an implementation.
+    const nop = _ => 0;
+
+    //Creates the error message for malformed data.
+    const malformed = (i, v, a, b) => `Malformed data found when decoding index \`B${i}\`. Found \`B${v}\` but expected between \`B${a}\` to \`B${b}\`.`;
+
+    //Runs a function, ids any returned functions or scriptors, then returns an encoded response to be sent back
+    //to lua.
+    const run = (data, is_scriptor) => {
+        let func = data.shift();
+
+        if (is_scriptor) func = func.call;
+
+        const result = func(...data);
+
+        //Object.keys returns an empty array for all other JS primitives, which means as long as
+        //this check passes, we can enumerate through the result, and handle accordingly. This
+        //means that if a user returns something non simple (a Map, a Date, etc), we will
+        //effectively do nothing. That's alright, as when we encode the data, it will be handled
+        //appropriately by Encoder, regardless of type (Generally, that means turning it into a
+        //string).
+        if (result !== undefined && result !== null && typeof result !== "string") {
+            lib.iterate(result, (k, v) => {
+                if (typeof k === "function") state.funcs.push(k);
+                if (typeof v === "function") state.funcs.push(v);
+                if (lib.scriptorlike(v)) state.scriptors[v.name] = v;
+                if (lib.scriptorlike(k)) state.scriptors[k.name] = k;
+            });
+        }
+
+        //We also need to account for if the return is a function itself.
+        if (typeof result === "function") state.funcs.push(result);
+
+        //Or if it smells like a scriptor.
+        if (lib.scriptorlike(result)) state.scriptors[result.name] = result;
+        
+        //While we can technically go through the entire encoding process to return an "undefined" to lua, the
+        //result for the end user is the same as if we just send back nothing. This saves cycles by avoiding having
+        //to encode on the JS side, and decode on the lua side.
+        if (result === undefined) return [ 0 ];
+
+        return encoder.convert(result, 1);
+    }
+    
+    //We use the same constructor function for Encoder and Decoder both need state, and Decoder simply ignores the
+    //data property, since it never uses it. All functions in Encoder and Decoder are functions() {} instead of
+    //arrow functions because lib.Factory needs to bind to them, and you are unable to bind to arrow functions.
+    const konstruct = function(self, _, state) {
+        self.data  = [];
+        self.state = state;
+    }
+
+    //Fetch a lua module. Either returns an object which contains the code under the 'code' property, or returns
+    //nothing. Passing force will force the ignore the "public" flag. When fetching a user's modules, we fetch
+    //everything that they've authored. This is because often, a user will have multiple modules of their own
+    //that they want to require, and so to avoid having to continuously dip back into the database, we simply
+    //check the 'user_modules' object to grab the next relevant thing.
+    const fetch = (author, name, force) => {
+        //If we haven't fetched this user's modules, grab all of them.
+        if (!user_modules[author]) {
+            user_modules[author] = #db.f({
+                lua_module: true,
+                author: author
+            }).array();
+        }
+        
+        //We need to know if we're looking for the script writer's module, or someone elses.
+        const self = context.author === author;
+
+        //Look at the modules of the author who's name we provided. We want the single module who's name matches
+        //the one we provided. The module also has to be public, or force is true, or we're looking at the script
+        //authors own modules.
+        const modules = user_modules[author].filter(module => module._id === name && (module.public || force || self));
+
+        //If we somehow find more than one module, something fucked up over in lua54.upload.
+        if (modules.length > 1) throw new LuaSevereError("Multiple modules with the same name found!");
+
+        return modules.pop();
+    };
+
+    //Used in tracking certain, returned values. Obviously, we can't actually pass a javascript function to lua, but
+    //we can keep a reference to it whenever we get one, and pass an id back and forth so we can refer to it. We also
+    //track any values that have been returned by the user, and depending on the amount, either return 1 item, or an
+    //array of items. In the future, state may expand to include other non transmittable javascript types, so that
+    //the user can still manipulate these data types without ever having true access to them.
+    const state = {
+        funcs:     [],
+        prints:    [],
+        ret_val:   [],
+        scriptors: {}
+    };
+
+    //TODO: Add every single JS primitive available in Hackmud to Encoder. :upside_down_smile: For now though,
+    //this will cover 95% of use cases, based on the 7 months of v1 of lua54.exe.
+    const Encoder = lib.Factory(konstruct, {
+        convert: function(self, _, v, is_new) {
+            const type = typeof v;
+            
+            if (is_new !== undefined) self.data = [ is_new ];
+            
+            //Hey. Don't. Resist the impulse to reorder these if's to be more visually pleasing.
+            //Don't fuck up the logic because you want stuff aligned. The bug will drive you crazy.
+            if      (type === "boolean")  self.boolean(v);
+            else if (type === "number")   self.number(v);
+            else if (type === "string")   self.string(v);
+            else if (v    === null)       self.nuhl();
+            else if (v    === undefined)  self.undef();
+            else if (type === "function") self.func(v);
+            else if (lib.scriptorlike(v)) self.scriptor(v);
+            else if (v instanceof Array)  self.array(v);
+            
+            //This check is *not* foolproof. If, for some reason, the user has done something like
+            //Object.defineProperty(my_class, Symbol.toStringTag, { get: _ => "Object" });
+            //Then the return value will be misleading. *However*, that merely means that we then
+            //attempt to enumerate the properties of said object. That means that once the values
+            //reach lua, at best, some will be missing, and at worse, you are exposed to values
+            //you would have been just as likely to be exposed to if it was a bog standard object.
+            //The safety of the code is up to the robustness of the user, not the glue code.
+            else if (String(v) === "[object Object]" || String(v) === "[object Map]") self.object(v);
+
+            //Unlike on the lua side, we do not have a safety flag. Code on the lua side is exposed
+            //to the user, and therefore they can define how strict they'd like to be when making
+            //a conversion. This translation layer, on the other hand, can not be affected by the
+            //user, and therefore must be opinionated when encountering one of the *many* different
+            //datatypes JS has. All unexpected data types are converted to a string using a string
+            //constructor, which works for all JS primitives.
+            else self.string(String(v));
+
+            return self.data;
+        },
+        boolean: function(self, _, v) {
+            self.data.push(v ? 1 : 0);
+        },
+        number: function(self, _, v) {
+            self.data.push(2, v);
+        },
+        string: function(self, _, v) {
+            //Since JS doesn't treat strings as arbitrary bytes, but specifically as textual data,
+            //v.length === utf8.len(v)
+            //As for why we're iterating in this specific manner:
+            //https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/codePointAt#looping_with_codepointat
+            self.data.push(3, v.length, ...([...v]).map(cp => cp.codePointAt(0)));
+        },
+        func: function(self, _, v) {
+            const funcs = self.state.funcs;
+            const len   = funcs.length;
+
+            self.data.push(7);
+            
+            for (let i = 0; i < len; i++) {
+                if (funcs[i] === v) {
+                    self.data.push(i);
+
+                    break;
+                }
+            }
+        },
+        scriptor: function(self, _, v) {
+            self.data.push(6);
+            self.string(v.name);
+        },
+        array: function(self, _, v) {
+            self.data.push(4, v.length);
+
+            for (const vv of v) self.convert(vv);
+        },
+        object: function(self, _, v) {
+            let entries = Object.entries(v);
+            
+            //When running an echo, our data is stored in a map instead of an object, and so we
+            //need to pull out the entries differently.
+            if (self.as_map) entries = Array.from(v.entries());
+
+            self.data.push(5, entries.length);
+
+            for (const [ k, vv ] of entries) {
+                self.convert(k);
+                self.convert(vv);
+            }
+        },
+        nuhl: function(self) {
+            self.data.push(8);
+        },
+        undef: function(self) {
+            self.data.push(9);
+        }
+    });
+
+    //We reference encoder in decoder, so we create this immediately.
+    const encoder = new Encoder(state);
+
+    const Decoder = lib.Factory(konstruct, {
+        //This function converts data from lua into data for JS. Generally, we want to run some native JS
+        //function with some sort of data. What we expect to see is an identifying value for the action, along
+        //with preprocessed values. This is very strict, and we should throw if the data is in any way
+        //malformed, since that data is an encoder/decoder error, and therefore a fuck up on our part, rather
+        //than the user's.
+        process: function(self, _, v) {
+            const action = v[0];
+
+            self.index = 0;
+            
+            try {
+                const data = self.convert(v);
+                
+                //0 is returning a value from a script. This can be called multiple times. Each call adds
+                //an entry to an array. If that final array has more than one value, we assume that the
+                //end user is trying to return multiple things; a feature available to lua but not to JS.
+                //Data should always be an array; we can loop through it and add each item to ret_val as
+                //it's own thing. This means that multiple returns doesn't involve multiple calls internally.
+                //One "return" equals one hop back and forth, rather than one for each item.
+                if (action === 0) {
+                    for (const v of data) self.state.ret_val.push(v);
+                    
+                    return [ 0 ];
+                }
+                
+                //1 is running a database operation. We then check the sub action to determine which db
+                //func to run, as well as what cursor method (this may be false if the func we're running
+                //doesn't take a cursor), before spreading our db_args into the db function. If the cursor
+                //takes an arg, and we recieved a cursor_arg (not false), then we pass that in as well.
+                //Some cursor methods would be pointless to call from lua. For example, we can sort the
+                //data once it's been sent over, so there's no reason to do it here. We can sort, but the
+                //cursor_arg needs to be a JS function that already exists (very niche; this presumes a
+                //scriptor returns a function that can be used, or can be used itself directly as a
+                //callback for each, which, who would trust someone to do that? And if you wanted to
+                //foreach the values, why not bring it into lua and do it?). The main logic for allowing
+                //this is to reduce the amount of data that needs to be sent back from a db call, such as
+                //with limit(num) or distinct(key).
+                else if (action === 1) {
+                    let response;
+
+                    //There's no need to type check these values, as they are built to be valid using
+                    //helper functions on the lua side.
+                    const [ op, cursor, db_args, cursor_arg ] = data;
+
+                    //Valid cursors (we don't error check this; db operations should only happen
+                    //within the meta, so we don't have to worry about exposing our db to the user):
+                    //"first"|"array"|"count"|"distinct"|"skip"|"limit"
+                    if (op === 1) {
+                        const cf = #db.f(...db_args)[cursor];
+
+                        if (cursor === "skip" || cursor === "limit") {
+                            response = cf(cursor_arg).close();
+                        } else if (cursor_arg !== undefined) {
+                            response = cf(cursor_arg);
+                        } else {
+                            response = cf();
+                        }
+                    }
+
+                    //db.i can take an array of items, so we don't actually spread in this case. The response of the
+                    //db tends to be pretty useless, so we also formulate a slightly more useful one (we do this for
+                    //most ops that return a "success" response).
+                    else if (op === 2) {
+                        const start = Date.now();
+                        const ar    = #db.i(db_args)[0];
+                        const end   = Date.now() - start;
+
+                        response = {
+                            ok: true,
+                            inserted: db_args.length,
+                            op_time: end,
+                            ids: ar.inserted_ids
+                        };
+                    }
+                    
+                    //Just the oid. Ez pz.
+                    else if (op === 3) {
+                        result = #db.ObjectId()["$oid"];
+                    }
+                    
+                    //Since db operations are hidden behind helper functions in lua, we don't have to worry about
+                    //db shenanigans. However, we do a sanity check when wiping; if the count of the operation will
+                    //erase more than 10 items, then the user must also pass a confirmation. We also staunchly will
+                    //never wipe the entire db as a last safety check.
+                    else if (op === 4) {
+                        if (JSON.stringify(db_args) == "{}") throw DatabaseAccessError("Attempted to wipe the entire DB!");
+                        
+                        const num = #db.f(db_args).count();
+
+                        if (num > 10 && !cursor_arg) throw ({ type: "db_remove", num });
+
+                        response = #db.r(db_args)[0];
+                        response = {
+                            ok: true,
+                            removed: response.n,
+                            op_time: response.opTime.t
+                        };
+                    }
+                    
+                    //#db.u and #db.u1 are identical when the count of matched documents are the same, but
+                    //u1 is more performant. Therefore, if the intent is to update, we first count the documents
+                    //matched, and then run u or u1 appropriately. If for some reason, however, we explicitly want
+                    //to update just the first item, we can explicitly call u1 using op6. In 99.95% of cases
+                    //though, op5 is all that the end user will end up needing (all that we'll end up using in
+                    //meta.lua).
+                    else if (op === 5 || op === 6) {
+                        if (op === 6) {
+                            response = #db.u1(...db_args);
+                        } else {
+                            const num = #db.f(db_args[0]).count();
+
+                            //You can't use square bracket notation on #db.
+                            if (num === 1) {
+                                response = #db.u1(...db_args)[0];
+                            } else {
+                                response = #db.u(...db_args)[0];
+                            }
+                        }
+
+                        response = {
+                            ok: true,
+                            matched: response.n,
+                            op_time: response.opTime.t,
+                            modified: response.nModified
+                        };
+                    }
+                    
+                    else if (op === 7) {
+                        response = #db.us(...db_args)[0];
+                        
+                        response = {
+                            ok: true,
+                            matched: response.n,
+                            op_time: response.opTime.t,
+                            modified: response.nModified,
+                            upserted: response.upserted
+                        };
+                    }
+                    
+                    //index is 6:
+                    //action, table iden (1), length (2), (num iden, num) key (4), (num iden, num) value (6)
+                    else {
+                        throw LuaParserError(malformed(6, op, 0, 7));
+                    }
+
+                    return encoder.convert(response, 1);
+                }
+
+                //2 is running a scriptor. An arbitrary amount of args can be passed to the scriptor. When
+                //a user passes args, they are wrapped into a table over at lua. The first value is a
+                //'Scriptor', which means if the scriptor isn't one that exists, it will automatically catch
+                //and throw during the conversion process. Then, every consecutive value in the array is an
+                //arg. Running a scriptor can return all sorts of values, so there is an extra layer of
+                //processing needed; for example, if the output of a scriptor call is a function, then that
+                //function needs to be saved to state.funcs. If the output looks like a scriptor, then it
+                //should be saved to state.scriptors. Then everything is returned back to lua. The first
+                //value provided lets us know if we want to run the scriptor, or merely determine if it
+                //exists.
+                else if (action === 2) {
+                    return run(data, true);
+                }
+
+                //3 is for running a function saved to state. Processes in a way similar to scriptor. Unlike
+                //a scriptor, functions can't be created by the user, so we never have to worry that an invalid
+                //function ptr will have been sent over. The only way for them to get a function ptr in the
+                //first place is if given one from the JS side (scriptor call, or from an initally passed
+                //argument).
+                else if (action === 3) {
+                    return run(data);
+                }
+                
+                //4 is for error handling. By default, when an error is thrown, that information is pushed to
+                //the stack. However, pulling off arbitary data from the stack involves a different method
+                //of reading as opposed to our normal method for strings. So instead, within lua we create a
+                //version of the error function that calls lua_tojs and passes an error explicitly, before
+                //then throwing a real one. Calling lua_tojs lets us read out the data in the same manner as
+                //we would any other data and also lets us return more than just a string. By using that
+                //capability, we can check to see if it's a standard user error, or an encoder error, which
+                //we can then handle differently.
+                else if (action === 4) {
+                    if (typeof data === "object") throw LuaParserError(malformed(data[0], data[1], data[2], data[3]));
+
+                    self.state.err_msg = data;
+
+                    return [ 0 ];
+                }
+
+                //5 is fetching the context/args values. Context also returns an 'author' value, which is the
+                //author of the script. So if user a writes a luascript, which is exposed in user_a.lua_script,
+                //which is scropted in user_b.script, and called by user_c, then the caller is user_c, but the
+                //author is user_a. This only needs to be called once, and from then on these values are returned
+                //in a way that creates a clone each time, meaning users can't affect these global values.
+                //Another option would've been to tweak _G's __index and __newindex so users couldn't 
+                else if (action === 5) {
+                    return encoder.convert({ context, args }, 1);
+                }
+
+                //6 is timing info. Rather than send start, end, and timeout, we send the current time, the
+                //remaining time, and the elapsed time.
+                else if (action === 6) {
+                    const now = Date.now();
+
+                    return encoder.convert({
+                        current: now,
+                        elapsed: now - _START,
+                        remaining: _END - now
+                    }, 1);
+                }
+
+                //7 is #G. You can either read from, or upload to #G (although due to overhead, it is better to
+                //try to keep execution entirely within lua, and call lua scripts multiple times). However,
+                //imagine user_a writes a lua script that accomplishes a task. If user_b calls user_a's script
+                //multiple times, saving values to #G may decrease the overhead. That being said, it's
+                //reccommended that a user expose their module to be loaded by other users instead, and keeping
+                //things entirely within lua. But I'm not your mom :p
+                else if (action === 7) {
+                    for (const [ k, v ] of Object.entries(data)) {
+                        #G[k] = v;
+                    }
+
+                    return [ 0 ];
+                }
+                
+                //Fetch a module.
+                else if (action === 8) {
+                    //It's assumed that name processing will have been done on the lua side before making it here, so
+                    //we don't need to do much. If there was an optional .lua, it will have been stripped before being
+                    //sent, and if the name was invalid (contained more than one other period) an error will be thrown.
+                    //This should already have the author and module name.                    
+                    const module = fetch(...data);
+
+                    if (!module) throw ({ type: "fetch", name: data });
+
+                    return module.code;
+                }
+                
+                //9 is echo, meant for internal use only. Data sent from lua is encoded, sent to JS, decoded,
+                //reencoded, then sent back to lua to be decoded once again. Let's us test if/how data gets
+                //affected without needing JS glue. Echo uses maps instead of objects to verify data integrity
+                //round trip.
+                else if (action === 9) {
+                    self.as_map = true;
+                    self.index  = 0;
+                    
+                    const data = self.convert(v);
+                    
+                    #D(data);
+
+                    self.as_map    = false;
+                    encoder.as_map = true;
+
+                    const out = encoder.convert(data, 1);
+                    
+                    encoder.as_map = false;
+
+                    return out;
+                }
+
+                //10 is for printing values. It functions similarly to return, except we do a bit of processing
+                //on it. For example, if the values are "easily" coercable to a string, then we seperate them
+                //with tabs. This includes strings, numbers, and booleans. We also place them all in a single
+                //array entry, since we want them all on the same line. If it's an array or an object, then we
+                //don't stringify it, and place it on it's own line. This let's hackmuds natural "stringifying"
+                //take place. Lastly, any value that isn't one of the ones previously mentioned gets JSON
+                //stringified. This keeps similar values as close as possible, while taking advantage of the
+                //natural functionality of hackmud. Printed values also go into a seperate array, and an argument
+                //the user passes defines whether prints are output or not. This way, if they are using lua,
+                //then sending the output somewhere else, the output doesn't change based on the amount of prints.
+                else if (action === 10) {
+                    let str = [];
+ 
+                    for (const v of data) {
+                        const T = typeof v;
+
+                        if (T === "string") {
+                            str.push(v);
+                        } else if (T === "number" || T === "boolean" || v === null || v === undefined) {
+                            str.push(String(v));
+                        } else if (v instanceof Array || T === "object") {
+                            if (str.length > 0) state.prints.push(str.join("\t"));
+
+                            state.prints.push(v);
+
+                            str = [];
+                        } else {
+                            if (str.length > 0) state.prints.push(str.join("\t"));
+
+                            state.prints.push(JSON.stringify(v));
+
+                            str = [];
+                        }
+                    }
+                    
+                    if (str.length > 0) state.prints.push(str.join("\t"));
+
+                    return [ 0 ];
+                }
+
+                //Catches our "success" message. We need this to know if the error in state.err_msg was from a
+                //caught error or not.
+                else if (action === 11) {
+                    state.success = true;
+
+                    return [ 0 ];
+                }
+
+                //Preloads. They're all already done, so we just need to send the right one off.
+                else if (action === 12) {
+                    return preload_modules[data];
+                }
+
+                throw LuaParserError(malformed(0, action, 0, 12));
+            } catch(e) {
+                if (e instanceof Error) throw e;
+
+                if (e.type === "no_scriptor") return encoder.convert(`Unable to call \`C${e.name}\` as it is not a currently loaded scriptor.`, 2);
+
+                if (e.type === "no_function") return encoder.convert(`Unable to call \`CJS.Function\`\`B<\`\`C0x${e.num.toString(16).toUpperCase()}\`\`B>\` as it is not a currently loaded function.`, 2);
+
+                if (e.type === "db_remove") return encoder.convert(`Sanity check! You attempted to wipe \`C${e.num}\` from the database. To delete more than \`C10\` items in a single call, pass \`Ctrue\` as a second parameter.`, 2);
+                
+                if (e.type === "fetch") return encoder.convert(`Failed to fetch lua module \`C${e.name}\`. Either the module is private, or it does not exist.`, 2);
+            }
+        },
+        convert: function(self, _, v) {
+            const byte = v[++self.index];
+
+            self.index++;
+            
+            if (byte === 0 || byte === 1) return self.boolean(v);
+            else if (byte === 2) return self.number(v);
+            else if (byte === 3) return self.string(v);
+            else if (byte === 4) return self.array(v);
+            else if (byte === 5) return self.object(v);
+            else if (byte === 6) return self.scriptor(v);
+            else if (byte === 7) return self.func(v);
+            else if (byte === 8) return self.nuhl();
+            else if (byte === 9) return self.undef();
+            
+            throw LuaParserError(malformed(self.index - 1, byte, 0, 9))
+        },
+        boolean: function(self, _, v) {
+            //A boolean is it's own iden byte and data.
+            return v[--self.index] === 1;
+        },
+        number: function(self, _, v) {
+            return v[self.index];
+        },
+        string: function(self, _, v) {
+            const arr = [];
+            const len = v[self.index];
+
+            //The first value after the iden byte is it's length. We increase index first to get each byte. We
+            //have to save len to a variable, as a for loop in js reruns the expression, thus refetching the
+            //data[self.index], unlike in lua.
+            for (let i = 0; i < len; i++) arr.push(String.fromCodePoint(v[++self.index]));
+            
+            return arr.join("");
+        },
+        array: function(self, _, v) {
+            const arr = [];
+            const len = v[self.index];
+            
+            //The first value after the iden byte is it's length. Since we are running convert and not an
+            //individual self[type](), we don't have to worry about modifying the index; it's handled by
+            //convert. The same len rule as string applies.
+            for (let i = 0; i < len; i++) arr.push(self.convert(v));
+
+            return arr;
+        },
+        object: function(self, _, v) {
+            let obj = {};
+
+            //We can replace objects with maps if this flag is set. This is useful for verifying that the data is
+            //translated effectively between lua, C, and javascript.
+            if (self.as_map) obj = new Map();
+
+            const len = v[self.index];
+
+            //The first value after the iden byte is the amount of key value pairs. The same len and indexing rules
+            //as array apply here.
+            for (let i = 0; i < len; i++) {
+                const k  = self.convert(v);
+                const vv = self.convert(v);
+
+                if (self.as_map) obj.set(k, vv);
+
+                else obj[k] = vv;
+            }
+
+            return obj;
+        },
+        scriptor: function(self, _, v) {
+            //A scriptor is identified by the scriptor iden byte, then is formatted like a string. That means
+            //there is another iden byte, which we skip over with the this.index++. While the extra iden byte
+            //isn't entirely necessary, it simplfies the encoding logic, since we can just call self:string(v)
+            //on the lua side. However, we do need to verify that the scriptor we are looking for actually
+            //exists. If we don't find it, then we throw a "no_scriptor" symbol, which is caught externally, and
+            //can be used to determine the type of response we send to lua.
+            self.index++;
+
+            const name = self.string(v);
+            const s    = state.scriptors[name];
+
+            if (!s) throw ({ type: "no_scriptor", name });
+
+            return s;
+        },
+        func: function(self, _, v) {
+            //Functions follow nearly the same process as a scriptor, but with a number instead of a string.
+            //Therefore, we don't need to increase the index, because unlike a string, inserting a number into
+            //the table as a byte is as easy as setting a value.
+            const num = v[self.index];
+            const f   = state.funcs[num];
+
+            if (!f) throw ({ type: "no_function", num });
+
+            return f;
+        },
+        nuhl: function(self) {
+            //A null is it's own iden byte and data.
+            self.index--;
+
+            return null;
+        },
+        undef: function(self) {
+            //An undefined is it's own iden byte and "data". We return nothing to save characters.
+            self.index--;
+        }
+    });
+
+    //We reference decoder in imports, so again we create immediately.
+    const decoder = new Decoder(state);
+    
+    //WASM expects it's imports in a very particular order, and so we need to match that exactly. We lose a few
+    //characters by defining it up here, but it helps with cleanliness, since the actual functions are tabbed so far
+    //in.
+    const imports = {
+        env: {
+            read_data: (ptr, length) => {
+                //Process our data. Will internally catch, and return encoded data, if needed.
+                const data = decoder.process(new Float64Array(memory, ptr, length))
+                
+                //Once we have this new array, we can insert the length, which C expects as the first value to know
+                //how long it is.
+                data.unshift(data.length);
+
+                //Make a new f64 array out of our data. Even if we're not returning anything to lua, we still to send
+                //*something* back, so at minimum our data will be [ 1, 0 ] (length, and "do nothing").
+                const f64 = new Float64Array(data);
+
+                //allocate space for this new array, and get back a pointer which we can use for setting and returning.
+                const newptr = exports.malloc(f64.byteLength);
+                
+                //Peek is a different view of our memory space, but this time offset with our newptr instead of our
+                //old one. We are unable to change the offset of view, so we need to create a whole new TypedArray for
+                //this.
+                const peek = new Float64Array(memory, newptr, f64.byteLength);
+
+                //Place the new data back into memory.
+                peek.set(f64);
+                
+                //Return the pointer. The C code needs this, and will free() the memory once it's done with it, so we
+                //don't need to worry about it anymore.
+                return newptr;
+            },
+            invoke_vii: (i, a, b) => {
+                let ptr;
+                
+                try {
+                    ptr = exports.stackSave();
+
+                    exports.__indirect_function_table.get(i)(a, b);
+                } catch (e) {
+                    exports.stackRestore(ptr);
+                    
+                    //Check for infinity, which is what longjmp throws. If it's not, then some other error happened
+                    //inside the C code.
+                    if (e !== e + 0) throw e;
+                    
+                    exports.setThrew(1, 0);
+                }
+            },
+            _emscripten_throw_longjmp: data => {
+                //This is how emscripten handles longjmps. Lua uses them for errors, and for coroutines, so not every
+                //longjmp is a bonafide error.
+                throw Infinity;
+            },
+            __syscall_dup3:       nop, //https://man.archlinux.org/man/dup3
+            __syscall_rmdir:      nop, //https://man.archlinux.org/man/rmdir
+            __syscall_unlinkat:   nop, //https://man.archlinux.org/man/unlinkat
+            _emscripten_system:   nop, //https://man7.org/linux/man-pages/man3/system
+            __syscall_renameat:   nop, //https://man.archlinux.org/man/renameat
+            __syscall_readlinkat: nop  //https://man.archlinux.org/man/readlinkat
+        },
+        wasi_snapshot_preview1: {
+            proc_exit: _ => {
+                //This is rarely called, as our C code simply returns when it's finished running. However, this can
+                //occasionally get called in a crash, although because of our specific workflow, it's generally
+                //unlikely. We throw a Symbol to be caught later.
+                throw Symbol.for("exit");
+            },
+            fd_read:           nop,
+            fd_seek:           nop,
+            fd_close:          nop,
+            fd_write:          nop,
+            environ_get:       nop,
+            clock_time_get:    nop,
+            environ_sizes_get: nop,
+            //fd_write: (fd , vec_ptr, vec_count, ptr) => {
+            //    //https://blog.dkwr.de/development/wasi-load-fd-write/
+            //    //While an explination for the logic of this code can be found above, we don't ever run any of this
+            //    //code, because we've overwritten the functionality of print within the lua. That means that this
+            //    //can all be replaced by a nop, but we keep it here since it is useful if we ever need to debug,
+            //    //or if we need print output from C.
+            //    const memory = new Uint32Array(exports.memory.buffer);
+            //    
+            //    let pos = 0;
+            //    
+            //    for (let i = 0; i < vec_count; i++) {
+            //        //jump over 2 i32 values per iteration
+            //        const offset = i * 8;
+            //        
+            //        //Get the vector from the pointer.
+            //        const vec = new Uint32Array(memory.buffer, vec_ptr + offset, 2);
+            //        
+            //        //Read the actual bytes from the vector.
+            //        const bytes = new Uint8Array(memory.buffer, vec[0], vec[1]);
+            //        
+            //        const data = lib.decode(bytes);
+            //        
+            //        //Convert the data into something usable, then write with the real data. lua sends newlines
+            //        //seperately from the rest of the data, so we only output it's not just a raw newline. That
+            //        //does technically mean you can't print a newline by itself for any reason, but then again,
+            //        //this code only runs for oprint, not the print that is exposed to the user.
+            //        
+            //        if (data !== "\n") #D("lua >" + data);
+            //        
+            //        //Move our position after having read off what we needed to.
+            //        pos += vec[1];
+            //    }
+            //    
+            //    //Now that we've written the data, we write how much we've written back into the buffer.
+            //    const written = new Uint32Array(memory.buffer, ptr, 1);
+            //    
+            //    written[0] = pos;
+            //    
+            //    return 0;
+            //}
+        }
+    };
+    
+    if (!(args.scriptors instanceof Array || args.scriptors === undefined)) throw new TypeError("`Nscriptors` is not of type `Carray`.");
+
+    //Before we init the module, move our scriptors over to state. A minor implementation difference; the original
+    //lua54.exe would discard any scriptor that wasn't an actual script in game. However, we don't care if the script
+    //exists or not. As long as it passes the smell test, we'll treat it like one.
+    for (const v of (args.scriptors || [])) {
+        if (!lib.scriptorlike(v)) throw new Error("Tried to pass a non scriptorlike to the `Bscriptors` array.");
+
+        state.scriptors[v.name] = v;
+    }
+
+    //WebAssembly normally wants you to instantiate using it's async methods, but obviously that's not an option in
+    //hackmud. So instead, we do it the synchronous way, which isn't often explained anywhere online.
+    const wasmbuf  = new Uint8Array(wasm);
+    const module   = new WebAssembly.Module(wasmbuf);
+    const instance = new WebAssembly.Instance(module, imports);
+    
+    //We declare exports and memory before actually setting the value; that's because we reference it inside of imports.
+    exports = instance.exports;
+    memory  = exports.memory.buffer;
+
+    //_initialize isn't our code, but emscripten's.
+    exports._initialize();
+    
+    try {
+        //Time to load all our modules! Meta involves loading a few different modules all at the same time, but
+        //we don't have the tools to load them correctly yet, so we need to bootstrap. A lot of these names are
+        //things in JS already, so we have to square bracket notation them. We do all of them for consistancy.
+        //The value isn't important, so we use a single digit num to save on chars.
+        const meta_modules = {
+            ["JS"]:         0,
+            ["meta"]:       0,
+            ["Null"]:       0,
+            ["Array"]:      0,
+            ["Object"]:     0,
+            ["Encoder"]:    0,
+            ["Decoder"]:    0,
+            ["require"]:    0,
+            ["JSObject"]:   0,
+            ["Function"]:   0,
+            ["Scriptor"]:   0,
+            ["extensions"]: 0
+        };
+
+        //Fetch each of our modules. If we fail to fetch any of these, we throw a SevereError, since that means
+        //we've accidentally deleted one of our modules at some point.
+        for (const [ k, _ ] of Object.entries(meta_modules)) {
+            const module = fetch("lua54", k, true);
+
+            if (!module) throw new LuaSevereError(`Missing required meta module \`C${k}\`.`);
+
+            meta_modules[k] = module.raw;
+        }
+
+        if (!(args.preload instanceof Array || args.preload === undefined)) throw new TypeError("`Npreload` is not of type `Carray`.");
+
+        //We also fetch any preloaded modules the user may have required. If we fail to fetch, then we throw, but
+        //it's not severe.
+        for (let path of (args.preload || [])) {
+            //Normally, when we fetch, we've already done error checking on the name. That happens on the lua side,
+            //so we're going to need to replicate that for any preloads we find.
+            if ((/\n/).test(path)) throw new LuaPreloadError("Preload paths can not contain newline characters.");
+            if ((/\s/).test(path)) throw new LuaPreloadError("Preload paths can not contain whitespace.");
+            if (path.replaceAll(/[^\.]/g, "").length > 2) throw new LuaPreloadError("Preload paths can not contain more than 2 periods.");
+
+            path = path.replace(/\.lua$/, "")
+            
+            let [ author, name ] = path.split(".");
+            
+            //The user can preload their own scripts. If they provided a public module, there's more checking to do.
+            if (!name) {
+                name   = author;
+                author = context.author;
+            } else {
+                if ((/^[^a-z_]/).test(author)) throw new LuaPreloadError("Module author must begin with a lowercase letter or an underscore.");
+                if (author.replaceAll(/[a-z\d_]/g, "").length > 0) throw new LuaPreloadError("Module author may only contain lowercase letters, numbers, or an underscore.");
+            }
+
+            const module = fetch(author, name);
+
+            if (!module) throw new LuaPreloadError(`Unable to preload module \`C${path}\`. Either it doesn't exist, or you don't have permission to view it.`);
+
+            preload_modules[author + "." + name] = module.code;
+        }
+        
+        //Now we need to build our code string. Due to how we are planning to utilize a local enviroment for the
+        //actual users function call, we don't need to worry about globals polluting the namespace. As well, because
+        //each function is named, if one of them errors, our stack trace will label it, so we don't have to wonder
+        //where there error came from. Each "function" that we're creating is actually the return of a require. But
+        //this way, we don't actually need to call require, which involves leaving lua, coming to JS, fetching, and
+        //returning. This is also a new implementation detail; since we preload modules like this, it also gives the
+        //user the option to preload modules that they know they're going to require, which can prevent the first
+        //second of runtime being wasted having to run back and forth to fetch every new module. However, the user
+        //isn't required to preload modules, so if they want to load something conditionally, that's still an option.
+        code = `loaded = {}
+
+author = "${context.author}"
+
+function extensions()
+${meta_modules["extensions"]}
+end
+` +
+//We don't want require to be overwritten yet, so *re*require.
+`function rerequire()
+${meta_modules["require"]}
+end
+
+function Object()
+${meta_modules["Object"]}
+end
+
+function Array()
+${meta_modules["Array"]}
+end
+
+function JSObject()
+${meta_modules["JSObject"]}
+end
+
+function Null()
+${meta_modules["Null"]}
+end
+
+function Function()
+${meta_modules["Function"]}
+end
+
+function Scriptor()
+${meta_modules["Scriptor"]}
+end
+
+function JS()
+${meta_modules["JS"]}
+end
+
+function Encoder()
+${meta_modules["Encoder"]}
+end
+
+function Decoder()
+${meta_modules["Decoder"]}
+end
+
+function init()
+${meta_modules["meta"]}
+end
+` +
+//The order in which these are loaded are very explicit, as some of these modules require others. We need to make
+//sure they're in the loaded table.
+`loaded["lua54.extensions"] = extensions() or true
+loaded["lua54.require"]    = rerequire()
+` +
+//Now that we have our updated require function, we need to overwrite the old one, so that all these functions
+//can use it.
+`require = loaded["lua54.require"]
+` +
+//Alright, let's continue loading our modules.
+`loaded["lua54.Object"] = Object()
+loaded["lua54.Scriptor"] = Scriptor()
+loaded["lua54.JSNull"] = Null()
+loaded["lua54.JSArray"] = Array()
+loaded["lua54.JSObject"] = JSObject()
+loaded["lua54.JSFunction"] = Function()
+loaded["lua54.JS"] = JS()
+loaded["lua54.Decoder"] = Decoder()
+loaded["lua54.Encoder"] = Encoder()
+` +
+//All of the values we created aren't referenced correctly; for example, we want Array to be the class, not the
+//function that created it. So we now have to reassign all of those variables. We could also refer to the loaded
+//table directly, since we have access to it at the top level, but this is more logically sound. The function
+//names were only temporary so we'd know the "name" of the chunk that'd error, if they do.
+`Object = loaded["lua54.Object"]
+Scriptor = loaded["lua54.Scriptor"]
+Null = loaded["lua54.JSNull"]
+Array = loaded["lua54.JSArray"]
+JSObject = loaded["lua54.JSObject"]
+Function = loaded["lua54.JSFunction"]
+JS = loaded["lua54.JS"]
+` +
+//This value is arbitrarily assigned a new random number when called. This prevents the user from creating their
+//own JS.Functions, since they won't be able to provide the randomly generated value (although they theoretically
+//could with RNG manipulation, but at that point it's a them problem).
+`checker = 0
+` +
+//We keep a reference to the old error function, since we do need to reference it in our rewritten error and
+//assert functions.
+`oerror = error
+` +
+//Encoder/Decoder objects. We only need the one; the OOP nature is merely a method to organize like-minded code
+//functionality together; the almost complete lack of state means we could've written them as disperate functions,
+//if we needed to. Now that they're global, we can require the rest meta.
+`encoder = loaded["lua54.Encoder"]
+decoder = loaded["lua54.Decoder"]
+` +
+//And finally, all of the meta functions. A lot of these are wrappers for encoder/decoder, or rewrite how certain
+//things work (like error and assert) to work with our new system. This is also where we define USER_ENV, which
+//is the enviroment in which all users run their code.
+`loaded["lua54.meta"] = init() or true
+` +
+//We have to seed, but doing it here saves us a jump back and forth.
+`math.randomseed(${Date.now()})`;
+
+        //Everything before this point was meta code. By saving this line number, we can later check to see if
+        //a syntax error came from us or the user.
+        meta_length = code.split("\n").length;
+
+        //The next thing to do is to add any modules the player might've preloaded. Unlike meta, we don't know how
+        //many of them there are, so we iterate through in a loop, instead. A player's module is run with the same
+        //enviroment that a user's script is, both to prevent them gaining access to stuff they shouldn't have, and
+        //also to provide consistancy. As well, by setting the function a variable named the same as the path,
+        //errors thrown will inherit the name of their function, allowing a better understanding of where the error
+        //is coming from. In our previous implementation, many errors at the "top" level would refer to line numbers
+        //that were effectively impossible for the user to debug, and the only reason no one complained is because
+        //no one used it. While it would be nice to function() wrap user code the same way we wrapped our own, we
+        //have to treat user code as inherently untrustworthy. For example, a simple MITM attack would be for the
+        //user to write 'end {malicious_code} function()'. While we could account for this, it puts us in an arms
+        //race against malicious users, and every failure would lead to at best other users code leaking, all the
+        //way up to code injection, or simply wiping the DB (including bytecode). By preencoding the modules, and
+        //having them 'require'd, they go through the same validation process as any other module, and therefore
+        //are confined to their environment with no chance of escape. 
+        for (const [ path, module ] of Object.entries(preload_modules)) {
+            code += `preload("${path}")`;
+        }
+        
+        //We encode the user's main code for the same reason.
+        preload_modules["main"] = encoder.convert(args.code, 1);
+
+        //Finally, we can load the user's code! To do so, we exactly like we do with a preload, but rather than
+        //discard the output, we capture them, and send the results back to javascript. We name it main, both
+        //because that's what it is, but also because it will never overwrite a user's preload (due to them having
+        //author.module formatting).
+        code += `result = { preload("main", true) }`;
+
+        //Inside preload, we run the call with xpcall. We verify that we've succesfully run main, and if we have,
+        //then the rest of result can be sent off. If we haven't, then we'll need to error. When a non native
+        //function runs, it uses our error function, which saves the stacktrace in err_msg. When a native function
+        //runs, it uses the default error function. That means that we check both places to determine which trace
+        //to use. We could exclusively use result[1], but errors from our error handler would have extra calls
+        //in it that we don't care about (would include error/oerror/preload in the trace). This keeps stacktraces
+        //more consistant.
+        code += `if table.remove(result, 1) then
+    lua_tojs(encoder:convert(Array(result), true, 0))
+    lua_tojs(encoder:convert(nil, true, 11))
+else
+    lua_tojs(encoder:convert(err_msg or result[1], true, 4))
+end`;
+        
+        //Sending a string pointer to C involves a different process than how we normally read strings. We need
+        //to convert our string into a \0 terminated one, then encode it with lib.encode(), which is a polyfill
+        //of TextEncoder().encode(). Then we can allocate space and set it in our memory buffer. C will call
+        //free once it's done with it, so we don't have to worry about freeing it.
+        const enc_str = lib.encode(code + "\0");
+        const address = exports.malloc(enc_str.length);
+        const u8      = new Uint8Array(memory, address);
+        
+        //Add our string to memory...
+        u8.set(enc_str);
+        
+        //And run interpret! C is now processing the string, and calling the various stuff it needs to. Once it's
+        //finished, it should return a pointer to an empty string; we can parse out as though it were an error
+        //message, and if the result is any empty string, we're all good.
+        const out = exports.interpret(address);
+        
+        exports.free(address);
+        
+        //If our address isn't some multiple of four, then Uint8Array will actually throw a fit. In that case, it's a
+        //pretty good indication that we have no error, so we can just be on our way. However, if we *do* have
+        //a memory address to check, and after checking we find it's not just an empty string, then we errored.
+        //This can be a syntax error, but this can also just be any error from any of our meta functions before
+        //we've written in our new error handler.
+        if (out % 4 === 0) {
+            //Our output string is \0 terminated, so we look through our bytes until we find a 0, then use that to
+            //create a new u8 array that contains exclusively the string. Then we pass that whole thing to
+            //lib.decode to turn it into an actual error message.
+            const data = lib.decode(new Uint8Array(memory, out, new Uint8Array(memory, out).indexOf(0)));
+            
+            //As mentioned above, the C code is supposed to return an empty string on success. From testing, we've
+            //noticed that an empty string always points towards the same memory location (9333), which isn't a
+            //multiple of four, and so we usually don't even get here. Still, it's worth double checking anyways.
+            if (data !== "") throw LuaSyntaxError(data);
+        }
+    } catch(e) {
+        //If we fall down here, we rewrap our syntax error with an extra "oopsie" message. Otherwise, #D the
+        //stack.
+        if (e instanceof Error) {
+            if (e instanceof LuaSyntaxError) {
+                let [ _, line ] = (/:(\d+):/).exec(e.message);               
+                const line_num = Number(line);
+                
+                #D(state)
+                #D(code.split("\n").slice(line_num - 10, line_num + 10).join("\n"))
+
+                throw new LuaSevereError("Woops! That's a mess up on my part. Please get in touch. `A(``B" + e.message + "``A)`");
+            }
+
+            #D(e.stack)
+
+            throw new LuaSevereError(e.message, e);
+        }
+
+        //If it's not an error, we want to coerce to a string, and throw it as a standard error. This should never
+        //happen.
+        else {
+            throw new Error("How did we get here? " + String(e));
+        }
+    }
+    
+    //If we have an error, then we should return that error, but only if state.success isn't true. The reason
+    //we don't just check for an err_msg is because if a user calls a function that errors, but that error was
+    //wrapped in pcall/xpcall, it *does* still error, which then sends that error over to JS. We don't want to
+    //display to the user that they failed, when their error was caught. To make the stack trace more accurate,
+    //we do some string manipulation; remove everything past the topmost C call, replace the top level string
+    //code with the users code, and change the remaining line numbers.
+    if (!state.success) {
+        const lines = state.err_msg.split("\n");
+        
+        for (let i = 0; i < lines.length; i++) {
+            lines[i] = lines[i].replace(/\[string "loaded = \{\}\.\.\."\]:(\d+):/, function(_, line_num) {
+                let str = '[string "..."]:' + String(Number(line_num) - meta_length) + ":";
+
+                return str;
+            })
+        }
+
+        state.err_msg = lines.join("\n");
+
+        if (state.prints.length > 0 && args.print) {
+            state.prints.push(state.err_msg);
+
+            return {
+                ok: false,
+                msg: state.prints
+            };
+        }
+
+        return {
+            ok: false,
+            msg: state.err_msg
+        };
+    }
+    
+    //If the user returned more than one value from their lua script, then we return the whole array of results.
+    //Otherwise, we just return the first value. If there is no first value, then we effectively return undefined,
+    //which is totally valid behaviour.
+    const final = state.ret_val.length > 1 ? state.ret_val : state.ret_val[0];
+
+    //Like with err, we want to make sure to output prints, if we have them, and the print arg was set to true.
+    if (state.prints.length > 0 && args.print) {
+        if (final !== undefined) state.prints.push(final);
+
+        return state.prints;
+    }
+
+    //If there's no prints, and final is undefined, we out { ok: true }. This is mainly so it's clear that something
+    //*did* happen. If the user wants an output of nothing, they can return an explicit null, or 0, or whatever.
+    if (final === undefined) return ({ ok: true });
+    
+    //All done.
+    return final;
+}
