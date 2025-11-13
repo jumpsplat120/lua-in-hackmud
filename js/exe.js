@@ -3,12 +3,6 @@ function(context, args) {
 
     args = args || {};
 
-    //if (context.caller !== "lua54") return ({ ok: false, msg:"sorry, we're not open right now"})
-
-    if (!args.code) return ({ ok:false, msg: "Missing `Ncode`." });
-
-    if (typeof args.code !== "string") throw new TypeError("`Ncode` is not of type `Cstring`.");
-
     if (args.reset) {
         //Disabled for safety.
         //#db.r({ wasm: true });
@@ -29,6 +23,10 @@ function(context, args) {
     //Howdy! :3
     if (args.quine) return #fs.scripts.quine();
     
+    if (!args.code) return ({ ok:false, msg: "Missing `Ncode`." });
+
+    if (typeof args.code !== "string") throw new TypeError("`Ncode` is not of type `Cstring`.");
+
     const lib = #fs.antimony.lib();
     const CEF = lib.CustomErrorFactory;
 
@@ -41,8 +39,7 @@ function(context, args) {
     //When we tried to invalidly access the DB. So far, it's only throw is when we attempt to wipe the DB.
     const DatabaseAccessError = CEF("`D.:: LUA54 DATABASE ERROR ::.`");
 
-    //Type of error that gets thrown when there's an interpreter error. This is on us, as user code will be caught
-    //by the new error function.
+    //Type of error that gets thrown when there's an interpreter error.
     const LuaSyntaxError = CEF("LuaSyntaxError");
 
     //For when a user tries to fetch a module they don't have access to, but within preload instead of within their
@@ -153,7 +150,7 @@ function(context, args) {
         //Look at the modules of the author who's name we provided. We want the single module who's name matches
         //the one we provided. The module also has to be public, or force is true, or we're looking at the script
         //authors own modules.
-        const modules = user_modules[author].filter(module => module._id === name && (module.public || force || self));
+        const modules = user_modules[author].filter(module => module._id === author + "|" + name + "|module" && (module.public || force || self));
 
         //If we somehow find more than one module, something fucked up over in lua54.upload.
         if (modules.length > 1) throw new LuaSevereError("Multiple modules with the same name found!");
@@ -282,7 +279,7 @@ function(context, args) {
             const action = v[0];
 
             self.index = 0;
-            
+
             try {
                 const data = self.convert(v);
                 
@@ -312,11 +309,11 @@ function(context, args) {
                 //with limit(num) or distinct(key).
                 else if (action === 1) {
                     let response;
-
+                    
                     //There's no need to type check these values, as they are built to be valid using
                     //helper functions on the lua side.
                     const [ op, cursor, db_args, cursor_arg ] = data;
-
+                    
                     //Valid cursors (we don't error check this; db operations should only happen
                     //within the meta, so we don't have to worry about exposing our db to the user):
                     //"first"|"array"|"count"|"distinct"|"skip"|"limit"
@@ -415,9 +412,9 @@ function(context, args) {
                     //index is 6:
                     //action, table iden (1), length (2), (num iden, num) key (4), (num iden, num) value (6)
                     else {
-                        throw LuaParserError(malformed(6, op, 0, 7));
+                        throw LuaParserError(malformed(6, op, 1, 7));
                     }
-
+                    
                     return encoder.convert(response, 1);
                 }
 
@@ -467,7 +464,7 @@ function(context, args) {
                 //in a way that creates a clone each time, meaning users can't affect these global values.
                 //Another option would've been to tweak _G's __index and __newindex so users couldn't 
                 else if (action === 5) {
-                    return encoder.convert({ context, args }, 1);
+                    return encoder.convert({ context, args: args.args || {} }, 1);
                 }
 
                 //6 is timing info. Rather than send start, end, and timeout, we send the current time, the
@@ -601,7 +598,7 @@ function(context, args) {
             const byte = v[++self.index];
 
             self.index++;
-            
+
             if (byte === 0 || byte === 1) return self.boolean(v);
             else if (byte === 2) return self.number(v);
             else if (byte === 3) return self.string(v);
@@ -629,7 +626,7 @@ function(context, args) {
             //have to save len to a variable, as a for loop in js reruns the expression, thus refetching the
             //data[self.index], unlike in lua.
             for (let i = 0; i < len; i++) arr.push(String.fromCodePoint(v[++self.index]));
-            
+
             return arr.join("");
         },
         array: function(self, _, v) {
@@ -712,10 +709,14 @@ function(context, args) {
     //in.
     const imports = {
         env: {
+            //Emscripten is magically handling memory growth for us! Waow!
+            emscripten_notify_memory_growth: (...rest) => {
+                memory = exports.memory.buffer;
+            },
             read_data: (ptr, length) => {
                 //Process our data. Will internally catch, and return encoded data, if needed.
                 const data = decoder.process(new Float64Array(memory, ptr, length))
-                
+
                 //Once we have this new array, we can insert the length, which C expects as the first value to know
                 //how long it is.
                 data.unshift(data.length);
@@ -726,11 +727,11 @@ function(context, args) {
 
                 //allocate space for this new array, and get back a pointer which we can use for setting and returning.
                 const newptr = exports.malloc(f64.byteLength);
-                
+
                 //Peek is a different view of our memory space, but this time offset with our newptr instead of our
                 //old one. We are unable to change the offset of view, so we need to create a whole new TypedArray for
                 //this.
-                const peek = new Float64Array(memory, newptr, f64.byteLength);
+                const peek = new Float64Array(memory, newptr, data.length);
 
                 //Place the new data back into memory.
                 peek.set(f64);
@@ -769,12 +770,7 @@ function(context, args) {
             __syscall_readlinkat: nop  //https://man.archlinux.org/man/readlinkat
         },
         wasi_snapshot_preview1: {
-            proc_exit: _ => {
-                //This is rarely called, as our C code simply returns when it's finished running. However, this can
-                //occasionally get called in a crash, although because of our specific workflow, it's generally
-                //unlikely. We throw a Symbol to be caught later.
-                throw Symbol.for("exit");
-            },
+            proc_exit:         nop,
             fd_read:           nop,
             fd_seek:           nop,
             fd_close:          nop,
@@ -866,6 +862,7 @@ function(context, args) {
             ["JSObject"]:   0,
             ["Function"]:   0,
             ["Scriptor"]:   0,
+            ["Database"]:   0,
             ["extensions"]: 0
         };
 
@@ -878,7 +875,7 @@ function(context, args) {
 
             meta_modules[k] = module.raw;
         }
-
+        
         if (!(args.preload instanceof Array || args.preload === undefined)) throw new TypeError("`Npreload` is not of type `Carray`.");
 
         //We also fetch any preloaded modules the user may have required. If we fail to fetch, then we throw, but
@@ -926,9 +923,8 @@ author = "${context.author}"
 function extensions()
 ${meta_modules["extensions"]}
 end
-` +
-//We don't want require to be overwritten yet, so *re*require.
-`function rerequire()
+
+function requireFactory()
 ${meta_modules["require"]}
 end
 
@@ -968,6 +964,10 @@ function Decoder()
 ${meta_modules["Decoder"]}
 end
 
+function Database()
+${meta_modules["Database"]}
+end
+
 function init()
 ${meta_modules["meta"]}
 end
@@ -975,11 +975,11 @@ end
 //The order in which these are loaded are very explicit, as some of these modules require others. We need to make
 //sure they're in the loaded table.
 `loaded["lua54.extensions"] = extensions() or true
-loaded["lua54.require"]    = rerequire()
+loaded["lua54.require"]    = requireFactory()
 ` +
 //Now that we have our updated require function, we need to overwrite the old one, so that all these functions
 //can use it.
-`require = loaded["lua54.require"]
+`my_require = loaded["lua54.require"]
 ` +
 //Alright, let's continue loading our modules.
 `loaded["lua54.Object"] = Object()
@@ -991,6 +991,7 @@ loaded["lua54.JSFunction"] = Function()
 loaded["lua54.JS"] = JS()
 loaded["lua54.Decoder"] = Decoder()
 loaded["lua54.Encoder"] = Encoder()
+loaded["lua54.Database"] = Database()
 ` +
 //All of the values we created aren't referenced correctly; for example, we want Array to be the class, not the
 //function that created it. So we now have to reassign all of those variables. We could also refer to the loaded
@@ -1003,15 +1004,12 @@ Array = loaded["lua54.JSArray"]
 JSObject = loaded["lua54.JSObject"]
 Function = loaded["lua54.JSFunction"]
 JS = loaded["lua54.JS"]
+Database = loaded["lua54.Database"]
 ` +
 //This value is arbitrarily assigned a new random number when called. This prevents the user from creating their
 //own JS.Functions, since they won't be able to provide the randomly generated value (although they theoretically
 //could with RNG manipulation, but at that point it's a them problem).
 `checker = 0
-` +
-//We keep a reference to the old error function, since we do need to reference it in our rewritten error and
-//assert functions.
-`oerror = error
 ` +
 //Encoder/Decoder objects. We only need the one; the OOP nature is merely a method to organize like-minded code
 //functionality together; the almost complete lack of state means we could've written them as disperate functions,
@@ -1030,7 +1028,7 @@ decoder = loaded["lua54.Decoder"]
         //Everything before this point was meta code. By saving this line number, we can later check to see if
         //a syntax error came from us or the user.
         meta_length = code.split("\n").length;
-
+        
         //The next thing to do is to add any modules the player might've preloaded. Unlike meta, we don't know how
         //many of them there are, so we iterate through in a loop, instead. A player's module is run with the same
         //enviroment that a user's script is, both to prevent them gaining access to stuff they shouldn't have, and
@@ -1051,7 +1049,7 @@ decoder = loaded["lua54.Decoder"]
         
         //We encode the user's main code for the same reason.
         preload_modules["main"] = encoder.convert(args.code, 1);
-
+        
         //Finally, we can load the user's code! To do so, we exactly like we do with a preload, but rather than
         //discard the output, we capture them, and send the results back to javascript. We name it main, both
         //because that's what it is, but also because it will never overwrite a user's preload (due to them having
@@ -1064,14 +1062,27 @@ decoder = loaded["lua54.Decoder"]
         //runs, it uses the default error function. That means that we check both places to determine which trace
         //to use. We could exclusively use result[1], but errors from our error handler would have extra calls
         //in it that we don't care about (would include error/oerror/preload in the trace). This keeps stacktraces
-        //more consistant.
-        code += `if table.remove(result, 1) then
-    lua_tojs(encoder:convert(Array(result), true, 0))
-    lua_tojs(encoder:convert(nil, true, 11))
-else
-    lua_tojs(encoder:convert(err_msg or result[1], true, 4))
+        //more consistant. We wrap alllll of this in one more xpcall, because (very rarely), this can error itself.
+        //For example, if the user is trying to encode an invalid string. If that happens, we catch and throw one
+        //more time. Why won't that error? Because 1, we're only ever doing errors at that point, so we don't have
+        //user values to return, and 2, we wrote the errors that get thrown, so we don't need to worry about them
+        //being invalidly formatted (a user could have an err string be invalid, for example, causing err_msg to
+        //throw when attempting to encode it and send, but that won't happen after the pcall).
+        code += `success = pcall(function()
+    if os_exit then
+        lua_tojs(encoder:convert(nil, true, 11))
+    elseif table.remove(result, 1) then
+        lua_tojs(encoder:convert(Array(result), true, 0))
+        lua_tojs(encoder:convert(nil, true, 11))
+    else
+        lua_tojs(encoder:convert(err_msg or result[1], true, 4))
+    end
+end)
+
+if not success then
+    lua_tojs(encoder:convert(err_msg, true, 4))
 end`;
-        
+
         //Sending a string pointer to C involves a different process than how we normally read strings. We need
         //to convert our string into a \0 terminated one, then encode it with lib.encode(), which is a polyfill
         //of TextEncoder().encode(). Then we can allocate space and set it in our memory buffer. C will call
@@ -1079,17 +1090,17 @@ end`;
         const enc_str = lib.encode(code + "\0");
         const address = exports.malloc(enc_str.length);
         const u8      = new Uint8Array(memory, address);
-        
+
         //Add our string to memory...
         u8.set(enc_str);
-        
+
         //And run interpret! C is now processing the string, and calling the various stuff it needs to. Once it's
         //finished, it should return a pointer to an empty string; we can parse out as though it were an error
         //message, and if the result is any empty string, we're all good.
         const out = exports.interpret(address);
-        
+
         exports.free(address);
-        
+
         //If our address isn't some multiple of four, then Uint8Array will actually throw a fit. In that case, it's a
         //pretty good indication that we have no error, so we can just be on our way. However, if we *do* have
         //a memory address to check, and after checking we find it's not just an empty string, then we errored.
@@ -1111,11 +1122,17 @@ end`;
         //stack.
         if (e instanceof Error) {
             if (e instanceof LuaSyntaxError) {
+                //If we get the explicit error "not enough memory", then that's likely an unhalting loop in the
+                //users code, and something growing out of control (a table, a string, etc).
+                if (e.message === "not enough memory") {
+                    return { ok: false, msg: "Not enough memory. Is there an endless loop within your code?" }
+                }
+
                 let [ _, line ] = (/:(\d+):/).exec(e.message);               
                 const line_num = Number(line);
-                
+
                 #D(state)
-                #D(code.split("\n").slice(line_num - 10, line_num + 10).join("\n"))
+                #D(code.split("\n").slice(line_num - 11, line_num + 10).join("\n"))
 
                 throw new LuaSevereError("Woops! That's a mess up on my part. Please get in touch. `A(``B" + e.message + "``A)`");
             }
@@ -1139,6 +1156,8 @@ end`;
     //we do some string manipulation; remove everything past the topmost C call, replace the top level string
     //code with the users code, and change the remaining line numbers.
     if (!state.success) {
+        if (!state.err_msg) throw new LuaSevereError("Something happened, but we failed to generate an error.");
+
         const lines = state.err_msg.split("\n");
         
         for (let i = 0; i < lines.length; i++) {
